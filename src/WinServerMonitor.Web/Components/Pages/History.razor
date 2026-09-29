@@ -1,0 +1,155 @@
+@page "/runs"
+@inject TaskRunService Runs
+@inject TaskDefinitionService Definitions
+
+<PageTitle>Historie běhů · WinServerMonitor</PageTitle>
+
+<header class="page-head">
+    <div>
+        <h1>Historie běhů</h1>
+        <p class="subtle">@_total běhů odpovídá filtru.</p>
+    </div>
+</header>
+
+<div class="filters">
+    <label>
+        Doména
+        <select @bind="_domain" @bind:after="ResetAndLoadAsync">
+            <option value="">Všechny</option>
+            @foreach (var d in _definitions.Select(d => d.Domain).Distinct().Order())
+            {
+                <option value="@d">@d</option>
+            }
+        </select>
+    </label>
+    <label>
+        Task
+        <select @bind="TaskId" @bind:after="ResetAndLoadAsync">
+            <option value="">Všechny</option>
+            @foreach (var d in _definitions.Where(d => string.IsNullOrEmpty(_domain) || d.Domain == _domain))
+            {
+                <option value="@d.Id">@d.Name</option>
+            }
+        </select>
+    </label>
+    <label>
+        Stav
+        <select @bind="Status" @bind:after="ResetAndLoadAsync">
+            <option value="">Všechny</option>
+            @foreach (var s in Enum.GetValues<TaskRunStatus>())
+            {
+                <option value="@s">@Fmt.StatusLabel(s)</option>
+            }
+        </select>
+    </label>
+    <label>
+        Hledat
+        <input type="search" placeholder="název nebo text chyby" @bind="_search" @bind:after="ResetAndLoadAsync" />
+    </label>
+</div>
+
+<section class="card">
+    <table class="table">
+        <thead>
+            <tr>
+                <th class="num">#</th>
+                <th>Task</th>
+                <th>Doména</th>
+                <th>Stav</th>
+                <th>Spuštěno</th>
+                <th>Start</th>
+                <th class="num">Trvání</th>
+                <th>Výsledek / chyba</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+            @foreach (var run in _items)
+            {
+                <tr>
+                    <td class="num"><a href="@($"runs/{run.Id}")">@run.Id</a></td>
+                    <td><a href="@($"runs/{run.Id}")">@run.TaskDefinition?.Name</a></td>
+                    <td><span class="domain">@run.TaskDefinition?.Domain</span></td>
+                    <td><StatusBadge Status="run.Status" /></td>
+                    <td>@Fmt.TriggerLabel(run.Trigger)@(run.Attempt > 1 ? $" ({run.Attempt}.)" : "")</td>
+                    <td>@Fmt.DateTime(run.StartedAtUtc ?? run.ScheduledForUtc)</td>
+                    <td class="num">@Fmt.Duration(run.Duration)</td>
+                    <td class="@(run.Status == TaskRunStatus.Failed ? "error-text" : "subtle") clip">@(run.ErrorMessage ?? run.ResultSummary)</td>
+                    <td class="actions">
+                        @if (run.Status.IsFinished())
+                        {
+                            <button class="btn small" @onclick="() => RerunAsync(run)">↻ Znovu</button>
+                        }
+                    </td>
+                </tr>
+            }
+        </tbody>
+    </table>
+    @if (_items.Count == 0)
+    {
+        <p class="subtle">Žádné běhy.</p>
+    }
+    <div class="pager">
+        <button class="btn small ghost" disabled="@(_skip == 0)" @onclick="() => PageAsync(-1)">← Novější</button>
+        <span class="subtle">@(_total == 0 ? 0 : _skip + 1)–@Math.Min(_skip + PageSize, _total) z @_total</span>
+        <button class="btn small ghost" disabled="@(_skip + PageSize >= _total)" @onclick="() => PageAsync(1)">Starší →</button>
+    </div>
+</section>
+
+@code {
+    private const int PageSize = 50;
+
+    [SupplyParameterFromQuery(Name = "task")]
+    public string? TaskId { get; set; }
+
+    [SupplyParameterFromQuery(Name = "status")]
+    public string? Status { get; set; }
+
+    [Inject] private CurrentUser User { get; set; } = default!;
+    [Inject] private NavigationManager Navigation { get; set; } = default!;
+
+    private List<TaskDefinition> _definitions = [];
+    private List<TaskRun> _items = [];
+    private int _total;
+    private int _skip;
+    private string _domain = "";
+    private string _search = "";
+
+    protected override async Task OnInitializedAsync()
+    {
+        _definitions = await Definitions.GetAllAsync();
+        await LoadAsync();
+    }
+
+    private async Task ResetAndLoadAsync()
+    {
+        _skip = 0;
+        await LoadAsync();
+    }
+
+    private async Task PageAsync(int direction)
+    {
+        _skip = Math.Max(0, _skip + direction * PageSize);
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        var filter = new RunFilter
+        {
+            Domain = string.IsNullOrEmpty(_domain) ? null : _domain,
+            TaskDefinitionId = int.TryParse(TaskId, out var id) ? id : null,
+            Status = Enum.TryParse<TaskRunStatus>(Status, out var s) ? s : null,
+            Search = _search,
+            Skip = _skip,
+            Take = PageSize,
+        };
+        (_items, _total) = await Runs.GetHistoryAsync(filter);
+    }
+
+    private async Task RerunAsync(TaskRun run)
+    {
+        var created = await Runs.RerunAsync(run.Id, await User.GetNameAsync());
+        Navigation.NavigateTo($"runs/{created.Id}");
+    }
+}

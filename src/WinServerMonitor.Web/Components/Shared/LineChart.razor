@@ -1,0 +1,130 @@
+@using System.Globalization
+@using System.Text.Json
+
+<figure class="chart-card">
+    <figcaption class="chart-head">
+        <span class="chart-title">@Title</span>
+        @if (Series.Count == 1 && Series[0].Values.Count > 0)
+        {
+            <span class="chart-latest">@Format(Series[0].Values[^1])</span>
+        }
+    </figcaption>
+    @if (Series.Count > 1)
+    {
+        <div class="legend">
+            @foreach (var s in Series)
+            {
+                <span class="legend-item">
+                    <span class="swatch" style="background:var(--series-@s.Slot)"></span>
+                    @s.Name
+                    @if (s.Values.Count > 0)
+                    {
+                        <strong>@Format(s.Values[^1])</strong>
+                    }
+                </span>
+            }
+        </div>
+    }
+
+    <div class="wsm-chart" data-labels="@_labelsJson" data-series="@_seriesJson" data-geom="@_geom">
+        <svg viewBox="0 0 @W @H" role="img" aria-label="@Title">
+            @for (var i = 0; i <= GridLines; i++)
+            {
+                var value = _max * i / GridLines;
+                var y = Y(value);
+                <g>
+                    <line class="grid @(i == 0 ? "baseline" : "")" x1="@N(PadLeft)" x2="@N(W - PadRight)" y1="@N(y)" y2="@N(y)" />
+                    <text class="axis-label" x="@N(PadLeft - 6)" y="@N(y + 4)" text-anchor="end">@Format(value)</text>
+                </g>
+            }
+
+            @if (Times.Count > 1)
+            {
+                foreach (var index in new[] { 0, Times.Count / 2, Times.Count - 1 })
+                {
+                    var anchor = index == 0 ? "start" : index == Times.Count - 1 ? "end" : "middle";
+                    <g><text class="axis-label" x="@N(X(index))" y="@N(H - 4)" text-anchor="@anchor">@Times[index].ToLocalTime().ToString("HH:mm:ss")</text></g>
+                }
+            }
+
+            @foreach (var s in Series)
+            {
+                if (s.Values.Count > 1)
+                {
+                    <polyline class="series-line" style="stroke:var(--series-@s.Slot)" points="@Points(s.Values)" />
+                }
+            }
+        </svg>
+        <div class="chart-crosshair" hidden></div>
+        <div class="chart-tooltip" hidden></div>
+    </div>
+</figure>
+
+@code {
+    private const int W = 640;
+    private const int H = 200;
+    private const int PadLeft = 64;
+    private const int PadRight = 10;
+    private const int PadTop = 10;
+    private const int PadBottom = 24;
+    private const int GridLines = 4;
+
+    [Parameter, EditorRequired] public string Title { get; set; } = "";
+    [Parameter, EditorRequired] public IReadOnlyList<DateTime> Times { get; set; } = [];
+    [Parameter, EditorRequired] public IReadOnlyList<ChartSeries> Series { get; set; } = [];
+    [Parameter] public Func<double, string> Format { get; set; } = v => v.ToString("0");
+
+    /// <summary>Fixed axis maximum (e.g. 100 for percentages). Otherwise derived from data.</summary>
+    [Parameter] public double? Max { get; set; }
+
+    private double _max = 1;
+    private string _labelsJson = "[]";
+    private string _seriesJson = "[]";
+    private string _geom = "";
+
+    protected override void OnParametersSet()
+    {
+        var dataMax = Series.SelectMany(s => s.Values).DefaultIfEmpty(0).Max();
+        _max = Max ?? NiceCeiling(dataMax);
+
+        _labelsJson = JsonSerializer.Serialize(Times.Select(t => t.ToLocalTime().ToString("HH:mm:ss")));
+        _seriesJson = JsonSerializer.Serialize(Series.Select(s => new
+        {
+            name = s.Name,
+            slot = s.Slot,
+            values = s.Values.Select(Format),
+        }));
+        _geom = string.Join(',', N(PadLeft), N(W - PadLeft - PadRight), N(W), N(PadTop), N(H - PadTop - PadBottom), N(H));
+    }
+
+    private double X(int index) =>
+        Times.Count <= 1 ? PadLeft : PadLeft + (W - PadLeft - PadRight) * index / (double)(Times.Count - 1);
+
+    private double Y(double value) =>
+        PadTop + (H - PadTop - PadBottom) * (1 - Math.Clamp(value / _max, 0, 1));
+
+    private string Points(IReadOnlyList<double> values) =>
+        string.Join(' ', values.Select((v, i) => $"{N(X(i))},{N(Y(v))}"));
+
+    private static string N(double value) => value.ToString("0.##", CultureInfo.InvariantCulture);
+
+    /// <summary>Rounds up to 1, 2, 2.5 or 5 × 10^n so grid labels stay readable.</summary>
+    private static double NiceCeiling(double value)
+    {
+        if (value <= 0)
+        {
+            return 1;
+        }
+
+        var magnitude = Math.Pow(10, Math.Floor(Math.Log10(value)));
+        foreach (var step in new[] { 1, 2, 2.5, 5, 10 })
+        {
+            if (step * magnitude >= value)
+            {
+                return step * magnitude;
+            }
+        }
+
+        return 10 * magnitude;
+    }
+}

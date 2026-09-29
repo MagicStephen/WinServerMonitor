@@ -1,0 +1,296 @@
+@page "/runs/{Id:long}"
+@implements IAsyncDisposable
+@inject TaskRunService Runs
+@inject IMonitorEvents Events
+@inject CurrentUser User
+@inject NavigationManager Navigation
+@inject IJSRuntime JS
+
+<PageTitle>Běh #@Id · WinServerMonitor</PageTitle>
+
+@if (_run is null)
+{
+    <p class="subtle">@(_notFound ? "Běh nenalezen (mohl být odstraněn retencí)." : "Načítám…")</p>
+    return;
+}
+
+<header class="page-head">
+    <div>
+        <a class="back" href="board">← Kanban</a>
+        <h1>
+            @_run.TaskDefinition?.Name <span class="subtle">#@_run.Id</span>
+        </h1>
+        <div class="head-meta">
+            <StatusBadge Status="_run.Status" />
+            <span class="domain">@_run.TaskDefinition?.Domain</span>
+            <span class="subtle">@_run.TaskDefinition?.TaskType</span>
+        </div>
+    </div>
+    <div class="actions">
+        @if (_run.Status == TaskRunStatus.Scheduled)
+        {
+            <button class="btn" @onclick="StartNowAsync">▶ Spustit teď</button>
+        }
+        @if (_run.Status.IsActive())
+        {
+            <button class="btn danger" @onclick="CancelAsync">Zrušit</button>
+        }
+        @if (_run.Status.IsFinished())
+        {
+            <button class="btn primary" @onclick="RerunAsync">↻ Spustit znovu</button>
+        }
+        <a class="btn ghost" href="@($"tasks/{_run.TaskDefinitionId}")">Upravit task</a>
+    </div>
+</header>
+
+@if (_message is not null)
+{
+    <div class="alert error" role="alert">@_message</div>
+}
+
+<section class="card">
+    <dl class="details">
+        <div><dt>Spuštěno</dt><dd>@Fmt.TriggerLabel(_run.Trigger)@(_run.RequestedBy is null ? "" : $" ({_run.RequestedBy})")</dd></div>
+        <div><dt>Pokus</dt><dd>@_run.Attempt / @(1 + (_run.TaskDefinition?.MaxRetries ?? 0))</dd></div>
+        <div><dt>Naplánováno</dt><dd>@Fmt.FullDateTime(_run.ScheduledForUtc)</dd></div>
+        <div><dt>Start</dt><dd>@Fmt.FullDateTime(_run.StartedAtUtc)</dd></div>
+        <div><dt>Konec</dt><dd>@Fmt.FullDateTime(_run.FinishedAtUtc)</dd></div>
+        <div><dt>Trvání</dt><dd>@Fmt.Duration(_run.Duration)</dd></div>
+        <div><dt>Server</dt><dd>@(_run.MachineName ?? "–")</dd></div>
+        @if (!string.IsNullOrEmpty(_run.ResultSummary))
+        {
+            <div class="wide"><dt>Výsledek</dt><dd>@_run.ResultSummary</dd></div>
+        }
+        @if (!string.IsNullOrEmpty(_run.ErrorMessage))
+        {
+            <div class="wide"><dt>Chyba</dt><dd class="error-text">@_run.ErrorMessage</dd></div>
+        }
+    </dl>
+
+    @if (_related.Count > 1)
+    {
+        <div class="related">
+            <span class="subtle">Související běhy:</span>
+            @foreach (var r in _related)
+            {
+                <a class="related-run @(r.Id == _run.Id ? "current" : "")" href="@($"runs/{r.Id}")">
+                    <span class="badge-icon @Fmt.StatusCss(r.Status)" aria-hidden="true">@Fmt.StatusIcon(r.Status)</span>
+                    #@r.Id <span class="subtle">@Fmt.TriggerLabel(r.Trigger)</span>
+                </a>
+            }
+        </div>
+    }
+</section>
+
+<section class="card">
+    <div class="card-head">
+        <h2>Log <span class="subtle">(@_logs.Count)</span></h2>
+        <div class="filters inline">
+            <select @bind="_minLevel" aria-label="Minimální úroveň">
+                <option value="@TaskLogLevel.Debug">Vše</option>
+                <option value="@TaskLogLevel.Info">Info a výš</option>
+                <option value="@TaskLogLevel.Warning">Varování a chyby</option>
+                <option value="@TaskLogLevel.Error">Jen chyby</option>
+            </select>
+            <input type="search" placeholder="hledat v logu" @bind="_logSearch" @bind:event="oninput" />
+            <label class="check"><input type="checkbox" @bind="_follow" /> Sledovat konec</label>
+            <a class="btn small ghost" href="@($"api/runs/{Id}/log.txt")" download>Stáhnout</a>
+        </div>
+    </div>
+    <div class="log" @ref="_logElement">
+        @foreach (var entry in VisibleLogs())
+        {
+            <div class="log-line level-@entry.Level.ToString().ToLowerInvariant()">
+                <span class="log-time">@entry.TimestampUtc.ToLocalTime().ToString("HH:mm:ss.fff")</span>
+                <span class="log-level">@entry.Level</span>
+                <span class="log-msg">@entry.Message</span>
+            </div>
+        }
+        @if (_logs.Count == 0)
+        {
+            <div class="subtle">@(_run.Status.IsActive() ? "Čekám na výstup…" : "Log je prázdný.")</div>
+        }
+    </div>
+</section>
+
+@code {
+    [Parameter] public long Id { get; set; }
+
+    private TaskRun? _run;
+    private List<TaskRun> _related = [];
+    private readonly List<TaskLogEntry> _logs = [];
+    private readonly Lock _logLock = new();
+    private TaskLogLevel _minLevel = TaskLogLevel.Debug;
+    private string _logSearch = "";
+    private bool _follow = true;
+    private bool _notFound;
+    private string? _message;
+    private ElementReference _logElement;
+    private readonly Debouncer _logRender = new(TimeSpan.FromMilliseconds(250));
+    private long _subscribedId;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        if (_subscribedId == Id)
+        {
+            return;
+        }
+
+        Unsubscribe();
+        _subscribedId = Id;
+        lock (_logLock)
+        {
+            _logs.Clear();
+        }
+
+        await LoadRunAsync();
+        if (_run is null)
+        {
+            return;
+        }
+
+        Events.LogAdded += OnLogAdded;
+        Events.RunChanged += OnRunChanged;
+        await LoadNewLogsAsync();
+    }
+
+    private async Task LoadRunAsync()
+    {
+        _run = await Runs.GetAsync(Id);
+        _notFound = _run is null;
+        if (_run is not null)
+        {
+            _related = await Runs.GetRelatedRunsAsync(_run);
+        }
+    }
+
+    /// <summary>Fetches entries newer than the last one we have (covers entries written before subscribing).</summary>
+    private async Task LoadNewLogsAsync()
+    {
+        long lastId;
+        lock (_logLock)
+        {
+            lastId = _logs.Count == 0 ? 0 : _logs.Max(l => l.Id);
+        }
+
+        var entries = await Runs.GetLogsAsync(Id, lastId);
+        lock (_logLock)
+        {
+            var known = _logs.Select(l => l.Id).ToHashSet();
+            _logs.AddRange(entries.Where(e => !known.Contains(e.Id)));
+            _logs.Sort((a, b) => a.Id.CompareTo(b.Id));
+        }
+    }
+
+    private IEnumerable<TaskLogEntry> VisibleLogs()
+    {
+        List<TaskLogEntry> snapshot;
+        lock (_logLock)
+        {
+            snapshot = [.. _logs];
+        }
+
+        return snapshot
+            .Where(l => l.Level >= _minLevel)
+            .Where(l => string.IsNullOrWhiteSpace(_logSearch) || l.Message.Contains(_logSearch, StringComparison.CurrentCultureIgnoreCase));
+    }
+
+    private void OnLogAdded(TaskLogEntry entry)
+    {
+        if (entry.TaskRunId != Id)
+        {
+            return;
+        }
+
+        lock (_logLock)
+        {
+            if (_logs.Count == 0 || _logs[^1].Id < entry.Id)
+            {
+                _logs.Add(entry);
+            }
+            else if (_logs.All(l => l.Id != entry.Id))
+            {
+                _logs.Add(entry);
+                _logs.Sort((a, b) => a.Id.CompareTo(b.Id));
+            }
+        }
+
+        _logRender.Trigger(() => InvokeAsync(StateHasChanged));
+    }
+
+    private void OnRunChanged(TaskRunChanged change)
+    {
+        if (change.RunId != Id && !_related.Any(r => r.Id == change.RunId) && change.TaskDefinitionId != _run?.TaskDefinitionId)
+        {
+            return;
+        }
+
+        _ = InvokeAsync(async () =>
+        {
+            await LoadRunAsync();
+            StateHasChanged();
+        });
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (_follow && _run is not null)
+        {
+            try
+            {
+                await JS.InvokeVoidAsync("wsm.scrollToBottom", _logElement);
+            }
+            catch (JSDisconnectedException)
+            {
+            }
+            catch (InvalidOperationException)
+            {
+                // prerendering
+            }
+        }
+    }
+
+    private async Task StartNowAsync() => await Execute(() => Runs.StartScheduledNowAsync(Id));
+
+    private async Task CancelAsync() => await Execute(() => Runs.CancelAsync(Id));
+
+    private async Task RerunAsync()
+    {
+        try
+        {
+            var run = await Runs.RerunAsync(Id, await User.GetNameAsync());
+            Navigation.NavigateTo($"runs/{run.Id}");
+        }
+        catch (Exception ex)
+        {
+            _message = ex.Message;
+        }
+    }
+
+    private async Task Execute(Func<Task> action)
+    {
+        try
+        {
+            _message = null;
+            await action();
+            await LoadRunAsync();
+        }
+        catch (Exception ex)
+        {
+            _message = ex.Message;
+        }
+    }
+
+    private void Unsubscribe()
+    {
+        Events.LogAdded -= OnLogAdded;
+        Events.RunChanged -= OnRunChanged;
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        Unsubscribe();
+        _logRender.Dispose();
+        return ValueTask.CompletedTask;
+    }
+}

@@ -1,0 +1,26 @@
+@inherits LayoutComponentBase
+
+<div class="shell">
+    <aside class="sidebar">
+        <a class="brand" href="">
+            <span class="brand-mark" aria-hidden="true">◢</span>
+            <span>WinServerMonitor</span>
+        </a>
+        <nav class="nav">
+            <NavLink href="" Match="NavLinkMatch.All"><span aria-hidden="true">▦</span> Přehled</NavLink>
+            <NavLink href="board"><span aria-hidden="true">☰</span> Kanban</NavLink>
+            <NavLink href="tasks"><span aria-hidden="true">⚙</span> Tasky</NavLink>
+            <NavLink href="runs"><span aria-hidden="true">≡</span> Historie běhů</NavLink>
+        </nav>
+        <div class="sidebar-footer">@Environment.MachineName</div>
+    </aside>
+    <main class="content">
+        @Body
+    </main>
+</div>
+
+<div id="blazor-error-ui" data-nosnippet>
+    Došlo k neočekávané chybě.
+    <a href="." class="reload">Obnovit</a>
+    <span class="dismiss">✕</span>
+</div>

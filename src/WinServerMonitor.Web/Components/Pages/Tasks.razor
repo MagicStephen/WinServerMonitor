@@ -1,0 +1,176 @@
+@page "/tasks"
+@implements IDisposable
+@inject TaskDefinitionService Definitions
+@inject TaskRunService Runs
+@inject TaskExecutorRegistry Executors
+@inject IMonitorEvents Events
+@inject CurrentUser User
+
+<PageTitle>Tasky · WinServerMonitor</PageTitle>
+
+<header class="page-head">
+    <div>
+        <h1>Tasky</h1>
+        <p class="subtle">Definice tasků seskupené podle domén.</p>
+    </div>
+    <a class="btn primary" href="tasks/new">+ Nový task</a>
+</header>
+
+<div class="filters">
+    <label>
+        Doména
+        <select @bind="_domain">
+            <option value="">Všechny</option>
+            @foreach (var d in _definitions.Select(d => d.Domain).Distinct().Order())
+            {
+                <option value="@d">@d</option>
+            }
+        </select>
+    </label>
+    <label>
+        Hledat
+        <input type="search" placeholder="název" @bind="_search" @bind:event="oninput" />
+    </label>
+</div>
+
+@if (_message is not null)
+{
+    <div class="alert @(_messageIsError ? "error" : "")" role="status">@_message</div>
+}
+
+@foreach (var group in Filtered().GroupBy(d => d.Domain).OrderBy(g => g.Key))
+{
+    <section class="card">
+        <h2><span class="domain">@group.Key</span></h2>
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>Název</th>
+                    <th>Typ</th>
+                    <th>Plán</th>
+                    <th>Další spuštění</th>
+                    <th>Poslední běh</th>
+                    <th>Aktivní</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                @foreach (var d in group)
+                {
+                    <tr class="@(d.IsEnabled ? "" : "disabled")">
+                        <td>
+                            <a href="@($"tasks/{d.Id}")"><strong>@d.Name</strong></a>
+                            @if (!string.IsNullOrEmpty(d.Description))
+                            {
+                                <div class="subtle small">@d.Description</div>
+                            }
+                        </td>
+                        <td>@(Executors.Find(d.TaskType)?.DisplayName ?? d.TaskType)</td>
+                        <td><code>@(d.CronExpression ?? "ručně")</code></td>
+                        <td>@NextRun(d)</td>
+                        <td>
+                            @if (_lastRuns.TryGetValue(d.Id, out var last))
+                            {
+                                <a href="@($"runs/{last.Id}")"><StatusBadge Status="last.Status" /></a>
+                                <span class="subtle small">@Fmt.DateTime(last.StartedAtUtc)</span>
+                            }
+                            else
+                            {
+                                <span class="subtle">–</span>
+                            }
+                        </td>
+                        <td>
+                            <label class="switch" title="@(d.IsEnabled ? "Vypnout plánování" : "Zapnout plánování")">
+                                <input type="checkbox" checked="@d.IsEnabled" @onchange="e => ToggleAsync(d, (bool)e.Value!)" />
+                                <span aria-hidden="true"></span>
+                            </label>
+                        </td>
+                        <td class="actions">
+                            <button class="btn small" @onclick="() => RunNowAsync(d)">▶ Spustit</button>
+                            <a class="btn small ghost" href="@($"runs?task={d.Id}")">Historie</a>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </section>
+}
+
+@if (_definitions.Count == 0)
+{
+    <p class="subtle">Zatím nejsou definované žádné tasky.</p>
+}
+
+@code {
+    private List<TaskDefinition> _definitions = [];
+    private Dictionary<int, TaskRun> _lastRuns = [];
+    private string _domain = "";
+    private string _search = "";
+    private string? _message;
+    private bool _messageIsError;
+    private readonly Debouncer _reload = new(TimeSpan.FromMilliseconds(500));
+
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadAsync();
+        Events.DefinitionsChanged += OnChanged;
+        Events.RunChanged += OnRunChanged;
+    }
+
+    private async Task LoadAsync()
+    {
+        _definitions = await Definitions.GetAllAsync();
+        _lastRuns = await Definitions.GetLastRunsAsync();
+    }
+
+    private IEnumerable<TaskDefinition> Filtered() => _definitions
+        .Where(d => string.IsNullOrEmpty(_domain) || d.Domain == _domain)
+        .Where(d => string.IsNullOrWhiteSpace(_search) || d.Name.Contains(_search, StringComparison.CurrentCultureIgnoreCase));
+
+    private string NextRun(TaskDefinition d)
+    {
+        if (!d.IsEnabled || d.CronExpression is null)
+        {
+            return "–";
+        }
+
+        var next = Definitions.PreviewSchedule(d.CronExpression, d.TimeZoneId, 1);
+        return next.Count == 0 ? "–" : $"{Fmt.DateTime(next[0])} ({Fmt.Relative(next[0])})";
+    }
+
+    private async Task ToggleAsync(TaskDefinition d, bool enabled)
+    {
+        await Definitions.SetEnabledAsync(d.Id, enabled);
+        d.IsEnabled = enabled;
+    }
+
+    private async Task RunNowAsync(TaskDefinition d)
+    {
+        try
+        {
+            var run = await Runs.RunNowAsync(d.Id, await User.GetNameAsync());
+            _message = $"Task „{d.Name}“ zařazen do fronty jako běh #{run.Id}.";
+            _messageIsError = false;
+        }
+        catch (Exception ex)
+        {
+            _message = ex.Message;
+            _messageIsError = true;
+        }
+    }
+
+    private void OnChanged() => _reload.Trigger(() => InvokeAsync(async () =>
+    {
+        await LoadAsync();
+        StateHasChanged();
+    }));
+
+    private void OnRunChanged(TaskRunChanged change) => OnChanged();
+
+    public void Dispose()
+    {
+        Events.DefinitionsChanged -= OnChanged;
+        Events.RunChanged -= OnRunChanged;
+        _reload.Dispose();
+    }
+}

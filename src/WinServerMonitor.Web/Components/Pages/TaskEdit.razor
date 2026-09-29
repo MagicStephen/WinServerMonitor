@@ -1,0 +1,299 @@
+@page "/tasks/new"
+@page "/tasks/{Id:int}"
+@inject TaskDefinitionService Definitions
+@inject TaskRunService Runs
+@inject TaskExecutorRegistry Executors
+@inject NavigationManager Navigation
+@inject CurrentUser User
+
+<PageTitle>@(IsNew ? "Nový task" : _model?.Name) · WinServerMonitor</PageTitle>
+
+@if (_model is null)
+{
+    <p class="subtle">@(_notFound ? "Task nenalezen." : "Načítám…")</p>
+    return;
+}
+
+<header class="page-head">
+    <div>
+        <a class="back" href="tasks">← Tasky</a>
+        <h1>@(IsNew ? "Nový task" : _model.Name)</h1>
+    </div>
+    @if (!IsNew)
+    {
+        <div class="actions">
+            <button class="btn" @onclick="RunNowAsync">▶ Spustit teď</button>
+            <a class="btn ghost" href="@($"runs?task={Id}")">Historie</a>
+        </div>
+    }
+</header>
+
+@if (_errors.Count > 0)
+{
+    <div class="alert error" role="alert">
+        @foreach (var e in _errors)
+        {
+            <div>@e</div>
+        }
+    </div>
+}
+@if (_message is not null)
+{
+    <div class="alert" role="status">@_message</div>
+}
+
+<form class="form" @onsubmit="SaveAsync" @onsubmit:preventDefault>
+    <section class="card">
+        <h2>Základ</h2>
+        <div class="form-grid">
+            <label>Název *<input @bind="_model.Name" required maxlength="200" /></label>
+            <label>
+                Doména *
+                <input @bind="_model.Domain" list="domains" required maxlength="100" />
+                <datalist id="domains">
+                    @foreach (var d in _domains)
+                    {
+                        <option value="@d"></option>
+                    }
+                </datalist>
+            </label>
+            <label class="span-2">Popis<textarea rows="2" @bind="_model.Description"></textarea></label>
+            <label>
+                Typ tasku *
+                <select @bind="_model.TaskType" @bind:after="OnTypeChanged">
+                    @foreach (var e in Executors.All.OrderBy(e => e.DisplayName))
+                    {
+                        <option value="@e.TaskType">@e.DisplayName</option>
+                    }
+                </select>
+            </label>
+            <div class="hint">@_executor?.Description</div>
+        </div>
+    </section>
+
+    @if (_executor is not null)
+    {
+        <section class="card">
+            <h2>Parametry – @_executor.DisplayName</h2>
+            <div class="form-grid">
+                @foreach (var p in _executor.Parameters)
+                {
+                    var name = p.Name;
+                    <label class="@(p.Kind == TaskParameterKind.MultilineText ? "span-2" : "")">
+                        @p.Label@(p.Required ? " *" : "")
+                        @switch (p.Kind)
+                        {
+                            case TaskParameterKind.MultilineText:
+                                <textarea class="code" rows="@(name == "Script" ? 10 : 3)" spellcheck="false"
+                                          value="@GetParam(name)" @onchange="e => SetParam(name, e.Value)"></textarea>
+                                break;
+                            case TaskParameterKind.Number:
+                                <input type="number" value="@GetParam(name)" @onchange="e => SetParam(name, e.Value)" />
+                                break;
+                            case TaskParameterKind.Boolean:
+                                <select value="@(GetParam(name) ?? "false")" @onchange="e => SetParam(name, e.Value)">
+                                    <option value="false">Ne</option>
+                                    <option value="true">Ano</option>
+                                </select>
+                                break;
+                            case TaskParameterKind.Choice:
+                                <select value="@GetParam(name)" @onchange="e => SetParam(name, e.Value)">
+                                    <option value="">– vyberte –</option>
+                                    @foreach (var c in p.Choices ?? [])
+                                    {
+                                        <option value="@c">@c</option>
+                                    }
+                                </select>
+                                break;
+                            default:
+                                <input value="@GetParam(name)" @onchange="e => SetParam(name, e.Value)" />
+                                break;
+                        }
+                        @if (!string.IsNullOrEmpty(p.Help))
+                        {
+                            <span class="hint">@p.Help</span>
+                        }
+                    </label>
+                }
+            </div>
+        </section>
+    }
+
+    <section class="card">
+        <h2>Plánování a běh</h2>
+        <div class="form-grid">
+            <label>
+                Cron výraz
+                <input class="code" @bind="_model.CronExpression" @bind:event="oninput" @bind:after="UpdatePreview" placeholder="prázdné = pouze ručně" />
+                <span class="hint">minuta hodina den měsíc den-v-týdnu (volitelně sekundy na začátku)</span>
+            </label>
+            <label>
+                Časové pásmo
+                <input @bind="_model.TimeZoneId" @bind:after="UpdatePreview" placeholder="@TimeZoneInfo.Local.Id" />
+                <span class="hint">Např. Europe/Prague. Prázdné = čas serveru.</span>
+            </label>
+            <div class="span-2 presets">
+                @foreach (var (label, cron) in Presets)
+                {
+                    <button type="button" class="btn small ghost" @onclick="() => SetCron(cron)">@label</button>
+                }
+            </div>
+            @if (_preview.Count > 0)
+            {
+                <div class="span-2 hint">Další spuštění: @string.Join(" · ", _preview.Select(p => Fmt.FullDateTime(p)))</div>
+            }
+            <label class="check"><input type="checkbox" @bind="_model.IsEnabled" /> Plánování zapnuto</label>
+            <label class="check"><input type="checkbox" @bind="_model.AllowConcurrentRuns" /> Povolit souběžné běhy</label>
+            <label>Timeout (s)<input type="number" min="0" @bind="_model.TimeoutSeconds" /><span class="hint">0 = bez limitu</span></label>
+            <label>Počet automatických opakování<input type="number" min="0" max="20" @bind="_model.MaxRetries" /></label>
+            <label>Prodleva před opakováním (s)<input type="number" min="0" @bind="_model.RetryDelaySeconds" /></label>
+        </div>
+    </section>
+
+    <div class="form-actions">
+        <button type="submit" class="btn primary">Uložit</button>
+        <a class="btn ghost" href="tasks">Zpět</a>
+        @if (!IsNew)
+        {
+            <button type="button" class="btn danger" @onclick="DeleteAsync">@(_confirmDelete ? "Opravdu smazat včetně historie?" : "Smazat")</button>
+        }
+    </div>
+</form>
+
+@code {
+    private static readonly (string Label, string Cron)[] Presets =
+    [
+        ("Každou minutu", "* * * * *"),
+        ("Každých 5 min", "*/5 * * * *"),
+        ("Každou hodinu", "0 * * * *"),
+        ("Denně 6:00", "0 6 * * *"),
+        ("Pracovní dny 7:30", "30 7 * * 1-5"),
+        ("1. den v měsíci 2:00", "0 2 1 * *"),
+    ];
+
+    [Parameter] public int? Id { get; set; }
+
+    private bool IsNew => Id is null;
+    private TaskDefinition? _model;
+    private Dictionary<string, string> _params = [];
+    private ITaskExecutor? _executor;
+    private List<string> _domains = [];
+    private List<string> _errors = [];
+    private IReadOnlyList<DateTime> _preview = [];
+    private string? _message;
+    private bool _notFound;
+    private bool _confirmDelete;
+
+    protected override async Task OnParametersSetAsync()
+    {
+        _domains = await Definitions.GetDomainsAsync();
+        if (IsNew)
+        {
+            var type = Executors.All.OrderBy(e => e.DisplayName).First().TaskType;
+            _model = new TaskDefinition { TaskType = type, Domain = _domains.FirstOrDefault() ?? "General" };
+        }
+        else
+        {
+            _model = await Definitions.GetAsync(Id!.Value);
+            _notFound = _model is null;
+        }
+
+        if (_model is not null)
+        {
+            _params = _model.GetParameters().ToDictionary();
+            OnTypeChanged();
+            UpdatePreview();
+        }
+    }
+
+    private void OnTypeChanged()
+    {
+        _executor = Executors.Find(_model!.TaskType);
+        foreach (var p in _executor?.Parameters ?? [])
+        {
+            if (!_params.ContainsKey(p.Name) && p.DefaultValue is not null)
+            {
+                _params[p.Name] = p.DefaultValue;
+            }
+        }
+    }
+
+    private string? GetParam(string name) => _params.GetValueOrDefault(name);
+
+    private void SetParam(string name, object? value) => _params[name] = value?.ToString() ?? "";
+
+    private void SetCron(string cron)
+    {
+        _model!.CronExpression = cron;
+        UpdatePreview();
+    }
+
+    private void UpdatePreview()
+    {
+        try
+        {
+            _preview = Definitions.PreviewSchedule(_model!.CronExpression, _model.TimeZoneId);
+        }
+        catch
+        {
+            _preview = [];
+        }
+    }
+
+    private async Task SaveAsync()
+    {
+        _message = null;
+        // Keep only parameters of the selected type.
+        var known = _executor?.Parameters.Select(p => p.Name).ToHashSet() ?? [];
+        _model!.SetParameters(_params.Where(p => known.Contains(p.Key)).ToDictionary());
+
+        _errors = Definitions.Validate(_model).ToList();
+        if (_errors.Count > 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var saved = await Definitions.SaveAsync(_model);
+            if (IsNew)
+            {
+                Navigation.NavigateTo($"tasks/{saved.Id}");
+            }
+            else
+            {
+                _message = "Uloženo.";
+            }
+        }
+        catch (Exception ex)
+        {
+            _errors = [ex.Message];
+        }
+    }
+
+    private async Task RunNowAsync()
+    {
+        var run = await Runs.RunNowAsync(Id!.Value, await User.GetNameAsync());
+        Navigation.NavigateTo($"runs/{run.Id}");
+    }
+
+    private async Task DeleteAsync()
+    {
+        if (!_confirmDelete)
+        {
+            _confirmDelete = true;
+            return;
+        }
+
+        try
+        {
+            await Definitions.DeleteAsync(Id!.Value);
+            Navigation.NavigateTo("tasks");
+        }
+        catch (Exception ex)
+        {
+            _errors = [ex.Message];
+            _confirmDelete = false;
+        }
+    }
+}

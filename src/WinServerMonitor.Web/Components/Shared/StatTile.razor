@@ -1,0 +1,22 @@
+<div class="tile @Class">
+    <div class="tile-label">@Label</div>
+    <div class="tile-value">@Value</div>
+    @if (!string.IsNullOrEmpty(Detail))
+    {
+        <div class="tile-detail">@Detail</div>
+    }
+    @if (Percent is { } p)
+    {
+        <div class="meter" role="meter" aria-valuenow="@p.ToString("0")" aria-valuemin="0" aria-valuemax="100" aria-label="@Label">
+            <div class="meter-fill @(p >= 90 ? "critical" : p >= 75 ? "warning" : "")" style="width:@(Math.Clamp(p, 0, 100).ToString("0.#", System.Globalization.CultureInfo.InvariantCulture))%"></div>
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter, EditorRequired] public string Label { get; set; } = "";
+    [Parameter, EditorRequired] public string Value { get; set; } = "";
+    [Parameter] public string? Detail { get; set; }
+    [Parameter] public double? Percent { get; set; }
+    [Parameter] public string? Class { get; set; }
+}

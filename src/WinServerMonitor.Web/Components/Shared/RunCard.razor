@@ -1,0 +1,67 @@
+<article class="run-card @Fmt.StatusCss(Run.Status)">
+    <div class="run-card-head">
+        <a class="run-card-title" href="@($"runs/{Run.Id}")">@Run.TaskDefinition?.Name</a>
+        <span class="run-id">#@Run.Id</span>
+    </div>
+    <div class="run-card-meta">
+        @if (ShowDomain)
+        {
+            <span class="domain">@Run.TaskDefinition?.Domain</span>
+        }
+        <span class="subtle">@Run.TaskDefinition?.TaskType</span>
+        @if (Run.Attempt > 1)
+        {
+            <span class="pill" title="Pokus">pokus @Run.Attempt</span>
+        }
+        @if (Run.Trigger != TaskTrigger.Schedule)
+        {
+            <span class="pill">@Fmt.TriggerLabel(Run.Trigger)</span>
+        }
+    </div>
+    <div class="run-card-time">
+        @switch (Run.Status)
+        {
+            case TaskRunStatus.Scheduled:
+                <span title="@Fmt.FullDateTime(Run.ScheduledForUtc)">◷ @Fmt.DateTime(Run.ScheduledForUtc) · @Fmt.Relative(Run.ScheduledForUtc)</span>
+                break;
+            case TaskRunStatus.Queued:
+                <span>čeká @Fmt.Duration(DateTime.UtcNow - Run.ScheduledForUtc)</span>
+                break;
+            case TaskRunStatus.Running:
+                <span>běží @Fmt.Duration(Run.Duration)</span>
+                break;
+            default:
+                <span title="@Fmt.FullDateTime(Run.FinishedAtUtc)">@Fmt.DateTime(Run.FinishedAtUtc) · trvání @Fmt.Duration(Run.Duration)</span>
+                break;
+        }
+    </div>
+    @if (!string.IsNullOrEmpty(Run.ErrorMessage) && Run.Status == TaskRunStatus.Failed)
+    {
+        <div class="run-card-error" title="@Run.ErrorMessage">@Run.ErrorMessage</div>
+    }
+    else if (!string.IsNullOrEmpty(Run.ResultSummary) && Run.Status == TaskRunStatus.Succeeded)
+    {
+        <div class="run-card-summary" title="@Run.ResultSummary">@Run.ResultSummary</div>
+    }
+    <div class="run-card-actions">
+        @if (Run.Status == TaskRunStatus.Scheduled)
+        {
+            <button class="btn small" @onclick="() => OnAction.InvokeAsync((Run, RunAction.StartNow))">▶ Spustit teď</button>
+        }
+        @if (Run.Status.IsActive())
+        {
+            <button class="btn small ghost" @onclick="() => OnAction.InvokeAsync((Run, RunAction.Cancel))">Zrušit</button>
+        }
+        @if (Run.Status.IsFinished())
+        {
+            <button class="btn small" @onclick="() => OnAction.InvokeAsync((Run, RunAction.Rerun))">↻ Znovu</button>
+        }
+        <a class="btn small ghost" href="@($"runs/{Run.Id}")">Logy</a>
+    </div>
+</article>
+
+@code {
+    [Parameter, EditorRequired] public TaskRun Run { get; set; } = default!;
+    [Parameter] public bool ShowDomain { get; set; } = true;
+    [Parameter] public EventCallback<(TaskRun Run, RunAction Action)> OnAction { get; set; }
+}

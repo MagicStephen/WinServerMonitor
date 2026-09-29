@@ -1,0 +1,202 @@
+@page "/board"
+@implements IDisposable
+@inject TaskRunService Runs
+@inject TaskDefinitionService Definitions
+@inject IMonitorEvents Events
+@inject CurrentUser User
+@inject NavigationManager Navigation
+
+<PageTitle>Kanban · WinServerMonitor</PageTitle>
+
+<header class="page-head">
+    <div>
+        <h1>Kanban tasků</h1>
+        <p class="subtle">Aktivní běhy a běhy dokončené za zvolené období. Aktualizuje se živě.</p>
+    </div>
+</header>
+
+<div class="filters">
+    <label>
+        Doména
+        <select @bind="Domain" @bind:after="OnDomainChangedAsync">
+            <option value="">Všechny</option>
+            @foreach (var d in _domains)
+            {
+                <option value="@d">@d</option>
+            }
+        </select>
+    </label>
+    <label>
+        Dokončené za
+        <select @bind="_hours" @bind:after="ReloadAsync">
+            <option value="1">1 hodinu</option>
+            <option value="6">6 hodin</option>
+            <option value="24">24 hodin</option>
+            <option value="168">7 dní</option>
+        </select>
+    </label>
+    <label>
+        Hledat
+        <input type="search" placeholder="název tasku" @bind="_search" @bind:event="oninput" />
+    </label>
+    <label class="check">
+        <input type="checkbox" @bind="_groupByDomain" /> Řádky podle domén
+    </label>
+</div>
+
+@if (_message is not null)
+{
+    <div class="alert @(_messageIsError ? "error" : "")" role="status">@_message</div>
+}
+
+@if (_groupByDomain)
+{
+    @foreach (var group in Filtered().GroupBy(r => r.TaskDefinition?.Domain ?? "").OrderBy(g => g.Key))
+    {
+        <section class="swimlane">
+            <h2 class="swimlane-title"><span class="domain">@group.Key</span> <span class="subtle">@group.Count() běhů</span></h2>
+            @RenderColumns(group.ToList(), showDomain: false)
+        </section>
+    }
+}
+else
+{
+    @RenderColumns(Filtered().ToList(), showDomain: true)
+}
+
+@code {
+    private static readonly TaskRunStatus[] Columns =
+    [
+        TaskRunStatus.Scheduled, TaskRunStatus.Queued, TaskRunStatus.Running,
+        TaskRunStatus.Succeeded, TaskRunStatus.Failed, TaskRunStatus.Cancelled,
+    ];
+
+    [SupplyParameterFromQuery(Name = "domain")]
+    public string? Domain { get; set; }
+
+    private List<TaskRun> _runs = [];
+    private List<string> _domains = [];
+    private int _hours = 24;
+    private string _search = "";
+    private bool _groupByDomain;
+    private string? _message;
+    private bool _messageIsError;
+    private readonly Debouncer _reload = new(TimeSpan.FromMilliseconds(400));
+    private Timer? _ticker;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _domains = await Definitions.GetDomainsAsync();
+        await ReloadAsync();
+        Events.RunChanged += OnRunChanged;
+        Events.DefinitionsChanged += OnDefinitionsChanged;
+
+        // Refresh relative times ("běží 12 s") while something is running or waiting.
+        _ticker = new Timer(_ =>
+        {
+            if (_runs.Any(r => r.Status is TaskRunStatus.Running or TaskRunStatus.Queued or TaskRunStatus.Scheduled))
+            {
+                _ = InvokeAsync(StateHasChanged);
+            }
+        }, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+    }
+
+    private async Task ReloadAsync()
+    {
+        _runs = await Runs.GetBoardAsync(string.IsNullOrEmpty(Domain) ? null : Domain, TimeSpan.FromHours(_hours));
+    }
+
+    private async Task OnDomainChangedAsync()
+    {
+        // Keep the filter in the URL so the view can be bookmarked / shared.
+        Navigation.NavigateTo(Navigation.GetUriWithQueryParameter("domain", string.IsNullOrEmpty(Domain) ? null : Domain), replace: true);
+        await ReloadAsync();
+    }
+
+    private IEnumerable<TaskRun> Filtered() =>
+        string.IsNullOrWhiteSpace(_search)
+            ? _runs
+            : _runs.Where(r => r.TaskDefinition?.Name.Contains(_search, StringComparison.CurrentCultureIgnoreCase) == true);
+
+    private RenderFragment RenderColumns(List<TaskRun> runs, bool showDomain) => __builder =>
+    {
+        <div class="board">
+            @foreach (var status in Columns)
+            {
+                var items = runs.Where(r => r.Status == status).ToList();
+                <section class="board-column @Fmt.StatusCss(status)">
+                    <header class="board-column-head">
+                        <StatusBadge Status="status" />
+                        <span class="count">@items.Count</span>
+                    </header>
+                    <div class="board-column-body">
+                        @foreach (var run in items)
+                        {
+                            <RunCard @key="run.Id" Run="run" ShowDomain="showDomain" OnAction="HandleActionAsync" />
+                        }
+                        @if (items.Count == 0)
+                        {
+                            <div class="empty">—</div>
+                        }
+                    </div>
+                </section>
+            }
+        </div>
+    };
+
+    private async Task HandleActionAsync((TaskRun Run, RunAction Action) args)
+    {
+        try
+        {
+            switch (args.Action)
+            {
+                case RunAction.StartNow:
+                    await Runs.StartScheduledNowAsync(args.Run.Id);
+                    Notify($"Task „{args.Run.TaskDefinition?.Name}“ zařazen do fronty.");
+                    break;
+                case RunAction.Cancel:
+                    var cancelled = await Runs.CancelAsync(args.Run.Id);
+                    Notify(cancelled ? $"Běh #{args.Run.Id} se ruší." : $"Běh #{args.Run.Id} již nelze zrušit.", !cancelled);
+                    break;
+                case RunAction.Rerun:
+                    var run = await Runs.RerunAsync(args.Run.Id, await User.GetNameAsync());
+                    Notify($"Znovu spuštěno jako běh #{run.Id}.");
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            Notify(ex.Message, true);
+        }
+
+        await ReloadAsync();
+    }
+
+    private void Notify(string message, bool isError = false)
+    {
+        _message = message;
+        _messageIsError = isError;
+    }
+
+    private void OnRunChanged(TaskRunChanged change) =>
+        _reload.Trigger(() => InvokeAsync(async () =>
+        {
+            await ReloadAsync();
+            StateHasChanged();
+        }));
+
+    private void OnDefinitionsChanged() =>
+        _ = InvokeAsync(async () =>
+        {
+            _domains = await Definitions.GetDomainsAsync();
+            StateHasChanged();
+        });
+
+    public void Dispose()
+    {
+        Events.RunChanged -= OnRunChanged;
+        Events.DefinitionsChanged -= OnDefinitionsChanged;
+        _ticker?.Dispose();
+        _reload.Dispose();
+    }
+}

@@ -1,0 +1,8 @@
+<span class="badge @Fmt.StatusCss(Status)">
+    <span class="badge-icon" aria-hidden="true">@Fmt.StatusIcon(Status)</span>@Fmt.StatusLabel(Status)
+</span>
+
+@code {
+    [Parameter, EditorRequired]
+    public TaskRunStatus Status { get; set; }
+}

@@ -1,0 +1,194 @@
+@page "/"
+@implements IDisposable
+@inject IMetricsHistory History
+@inject TaskRunService Runs
+@inject IMonitorEvents Events
+
+<PageTitle>Přehled · WinServerMonitor</PageTitle>
+
+<header class="page-head">
+    <div>
+        <h1>Přehled serveru</h1>
+        <p class="subtle">@Environment.MachineName · běží @Fmt.Duration(_latest?.Uptime) · vzorkování každé @_intervalText</p>
+    </div>
+</header>
+
+@if (_latest is null)
+{
+    <p class="subtle">Sbírám první vzorek metrik…</p>
+}
+else
+{
+    <section class="tiles">
+        <StatTile Label="CPU" Value="@Fmt.Percent(_latest.CpuPercent)" Percent="_latest.CpuPercent"
+                  Detail="@($"{Environment.ProcessorCount} logických jader")" />
+        <StatTile Label="Paměť RAM" Value="@Fmt.Percent(_latest.MemoryPercent)" Percent="_latest.MemoryPercent"
+                  Detail="@($"{Fmt.Bytes(_latest.MemoryUsedBytes)} z {Fmt.Bytes(_latest.MemoryTotalBytes)}")" />
+        <StatTile Label="Disk čtení" Value="@Fmt.Rate(_latest.DiskReadBytesPerSec)"
+                  Detail="@($"{Fmt.Number(_latest.DiskReadsPerSec)} operací/s")" />
+        <StatTile Label="Disk zápis" Value="@Fmt.Rate(_latest.DiskWriteBytesPerSec)"
+                  Detail="@($"{Fmt.Number(_latest.DiskWritesPerSec)} operací/s")" />
+        <StatTile Label="Fronta disku" Value="@Fmt.Number(_latest.DiskQueueLength, "0.##")" Detail="průměrná délka fronty" />
+    </section>
+
+    <section class="chart-grid">
+        <LineChart Title="Vytížení CPU" Times="_times" Max="100" Format="Fmt.Percent"
+                   Series="@([new ChartSeries("CPU", 1, _cpu)])" />
+        <LineChart Title="Využití paměti" Times="_times" Max="100" Format="Fmt.Percent"
+                   Series="@([new ChartSeries("RAM", 1, _memory)])" />
+        <LineChart Title="Disk – propustnost" Times="_times" Format="Fmt.Rate"
+                   Series="@([new ChartSeries("Čtení", 1, _diskRead), new ChartSeries("Zápis", 2, _diskWrite)])" />
+        <LineChart Title="Disk – IO operace za sekundu" Times="_times" Format="@(v => Fmt.Number(v))"
+                   Series="@([new ChartSeries("Čtení", 1, _iopsRead), new ChartSeries("Zápis", 2, _iopsWrite)])" />
+    </section>
+
+    <section class="two-col">
+        <div class="card">
+            <h2>Disky</h2>
+            @foreach (var drive in _latest.Drives)
+            {
+                <div class="drive">
+                    <div class="drive-head">
+                        <strong>@drive.Name</strong>
+                        <span class="subtle">@drive.Label @drive.Format</span>
+                        <span class="drive-free">volno @Fmt.Bytes(drive.FreeBytes) z @Fmt.Bytes(drive.TotalBytes)</span>
+                    </div>
+                    <div class="meter" role="meter" aria-valuenow="@drive.UsedPercent.ToString("0")" aria-valuemin="0" aria-valuemax="100" aria-label="@drive.Name">
+                        <div class="meter-fill @(drive.UsedPercent >= 90 ? "critical" : drive.UsedPercent >= 80 ? "warning" : "")"
+                             style="width:@drive.UsedPercent.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture)%"></div>
+                    </div>
+                </div>
+            }
+            @if (_latest.Drives.Count == 0)
+            {
+                <p class="subtle">Žádné pevné disky.</p>
+            }
+        </div>
+
+        <div class="card">
+            <h2>Top procesy</h2>
+            <table class="table compact">
+                <thead><tr><th>Proces</th><th class="num">PID</th><th class="num">CPU</th><th class="num">Paměť</th></tr></thead>
+                <tbody>
+                    @foreach (var p in _latest.TopProcesses)
+                    {
+                        <tr>
+                            <td class="proc" title="@p.Name">@p.Name</td>
+                            <td class="num">@p.Id</td>
+                            <td class="num">@Fmt.Number(p.CpuPercent, "0.0") %</td>
+                            <td class="num">@Fmt.Bytes(p.WorkingSetBytes)</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    </section>
+}
+
+<section class="card">
+    <div class="card-head">
+        <h2>Tasky za posledních 24 hodin</h2>
+        <a href="board" class="btn">Otevřít Kanban</a>
+    </div>
+    @if (_stats is not null)
+    {
+        <div class="task-stats">
+            @foreach (var (status, count) in StatItems())
+            {
+                <a class="task-stat" href="@($"runs?status={status}")">
+                    <StatusBadge Status="status" />
+                    <span class="task-stat-count">@count</span>
+                </a>
+            }
+        </div>
+    }
+    @if (_recentFailures.Count > 0)
+    {
+        <h3>Poslední chyby</h3>
+        <table class="table">
+            <thead><tr><th>Task</th><th>Doména</th><th>Skončil</th><th>Chyba</th></tr></thead>
+            <tbody>
+                @foreach (var run in _recentFailures)
+                {
+                    <tr>
+                        <td><a href="@($"runs/{run.Id}")">@run.TaskDefinition?.Name</a></td>
+                        <td><span class="domain">@run.TaskDefinition?.Domain</span></td>
+                        <td>@Fmt.DateTime(run.FinishedAtUtc)</td>
+                        <td class="error-text">@run.ErrorMessage</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    }
+</section>
+
+@code {
+    private ServerMetricsSnapshot? _latest;
+    private IReadOnlyList<DateTime> _times = [];
+    private IReadOnlyList<double> _cpu = [], _memory = [], _diskRead = [], _diskWrite = [], _iopsRead = [], _iopsWrite = [];
+    private RunStatistics? _stats;
+    private List<TaskRun> _recentFailures = [];
+    private string _intervalText = "";
+    private readonly Debouncer _taskRefresh = new(TimeSpan.FromMilliseconds(500));
+
+    protected override async Task OnInitializedAsync()
+    {
+        BuildSeries();
+        await RefreshTasksAsync();
+        History.SnapshotAdded += OnSnapshot;
+        Events.RunChanged += OnRunChanged;
+    }
+
+    private void BuildSeries()
+    {
+        var history = History.GetHistory();
+        _latest = History.Latest;
+        _times = history.Select(s => s.TimestampUtc).ToList();
+        _cpu = history.Select(s => s.CpuPercent).ToList();
+        _memory = history.Select(s => s.MemoryPercent).ToList();
+        _diskRead = history.Select(s => s.DiskReadBytesPerSec).ToList();
+        _diskWrite = history.Select(s => s.DiskWriteBytesPerSec).ToList();
+        _iopsRead = history.Select(s => s.DiskReadsPerSec).ToList();
+        _iopsWrite = history.Select(s => s.DiskWritesPerSec).ToList();
+        if (history.Count > 1)
+        {
+            _intervalText = Fmt.Duration(history[^1].TimestampUtc - history[^2].TimestampUtc);
+        }
+    }
+
+    private async Task RefreshTasksAsync()
+    {
+        _stats = await Runs.GetStatisticsAsync(TimeSpan.FromHours(24));
+        var (failures, _) = await Runs.GetHistoryAsync(new RunFilter { Status = TaskRunStatus.Failed, Take = 5 });
+        _recentFailures = failures;
+    }
+
+    private IEnumerable<(TaskRunStatus, int)> StatItems()
+    {
+        yield return (TaskRunStatus.Scheduled, _stats!.Scheduled);
+        yield return (TaskRunStatus.Queued, _stats.Queued);
+        yield return (TaskRunStatus.Running, _stats.Running);
+        yield return (TaskRunStatus.Succeeded, _stats.Succeeded);
+        yield return (TaskRunStatus.Failed, _stats.Failed);
+        yield return (TaskRunStatus.Cancelled, _stats.Cancelled);
+    }
+
+    private void OnSnapshot(ServerMetricsSnapshot snapshot) => _ = InvokeAsync(() =>
+    {
+        BuildSeries();
+        StateHasChanged();
+    });
+
+    private void OnRunChanged(TaskRunChanged change) => _taskRefresh.Trigger(() => InvokeAsync(async () =>
+    {
+        await RefreshTasksAsync();
+        StateHasChanged();
+    }));
+
+    public void Dispose()
+    {
+        History.SnapshotAdded -= OnSnapshot;
+        Events.RunChanged -= OnRunChanged;
+        _taskRefresh.Dispose();
+    }
+}
